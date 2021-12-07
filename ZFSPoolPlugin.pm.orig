@@ -395,25 +395,21 @@ sub zfs_list_zvol {
     return $list;
 }
 
-sub zfs_get_latest_snapshot {
-    my ($class, $scfg, $volname) = @_;
+sub zfs_get_sorted_snapshot_list {
+    my ($class, $scfg, $volname, $sort_params) = @_;
 
     my $vname = ($class->parse_volname($volname))[1];
 
-    # abort rollback if snapshot is not the latest
-    my @params = ('-t', 'snapshot', '-o', 'name', '-s', 'creation');
+    my @params = ('-H', '-t', 'snapshot', '-o', 'name', $sort_params->@*, "$scfg->{pool}\/$vname");
     my $text = $class->zfs_request($scfg, undef, 'list', @params);
     my @snapshots = split(/\n/, $text);
 
-    my $recentsnap;
-    foreach (@snapshots) {
-        if (/$scfg->{pool}\/$vname/) {
-            s/^.*@//;
-            $recentsnap = $_;
-        }
+    my $snap_names = [];
+    for my $snapshot (@snapshots) {
+	(my $snap_name = $snapshot) =~ s/^.*@//;
+	push $snap_names->@*, $snap_name;
     }
-
-    return $recentsnap;
+    return $snap_names;
 }
 
 sub status {
@@ -477,50 +473,63 @@ sub volume_snapshot_rollback {
     # caches, they get mounted in activate volume again
     # see zfs bug #10931 https://github.com/openzfs/zfs/issues/10931
     if ($format eq 'subvol') {
-	$class->zfs_request($scfg, undef, 'unmount', "$scfg->{pool}/$vname");
+	eval { $class->zfs_request($scfg, undef, 'unmount', "$scfg->{pool}/$vname"); };
+	if (my $err = $@) {
+	    die $err if $err !~ m/not currently mounted$/;
+	}
     }
 
     return $msg;
 }
 
 sub volume_rollback_is_possible {
-    my ($class, $scfg, $storeid, $volname, $snap) = @_;
+    my ($class, $scfg, $storeid, $volname, $snap, $blockers) = @_;
 
-    my $recentsnap = $class->zfs_get_latest_snapshot($scfg, $volname);
+    # can't use '-S creation', because zfs list won't reverse the order when the
+    # creation time is the same second, breaking at least our tests.
+    my $snapshots = $class->zfs_get_sorted_snapshot_list($scfg, $volname, ['-s', 'creation']);
 
-    die "can't rollback, no snapshots exist at all\n"
-	if !defined($recentsnap);
+    my $found;
+    $blockers //= []; # not guaranteed to be set by caller
+    for my $snapshot ($snapshots->@*) {
+	if ($snapshot eq $snap) {
+	    $found = 1;
+	} elsif ($found) {
+	    push $blockers->@*, $snapshot;
+	}
+    }
 
-    die "can't rollback, '$snap' is not most recent snapshot\n"
-	if $snap ne $recentsnap;
+    my $volid = "${storeid}:${volname}";
+
+    die "can't rollback, snapshot '$snap' does not exist on '$volid'\n"
+	if !$found;
+
+    die "can't rollback, '$snap' is not most recent snapshot on '$volid'\n"
+	if scalar($blockers->@*) > 0;
 
     return 1;
 }
 
-sub volume_snapshot_list {
+sub volume_snapshot_info {
     my ($class, $scfg, $storeid, $volname) = @_;
 
-    my ($vtype, $name, $vmid) = $class->parse_volname($volname);
+    my $vname = ($class->parse_volname($volname))[1];
 
-    my $zpath = "$scfg->{pool}/$name";
+    my @params = ('-Hp', '-t', 'snapshot', '-o', 'name,guid,creation', "$scfg->{pool}\/$vname");
+    my $text = $class->zfs_request($scfg, undef, 'list', @params);
+    my @lines = split(/\n/, $text);
 
-    my $snaps = [];
+    my $info = {};
+    for my $line (@lines) {
+	my ($snapshot, $guid, $creation) = split(/\s+/, $line);
+	(my $snap_name = $snapshot) =~ s/^.*@//;
 
-    my $cmd = ['zfs', 'list', '-r', '-H', '-S', 'name', '-t', 'snap', '-o',
-	       'name', $zpath];
-
-    my $outfunc = sub {
-	my $line = shift;
-
-	if ($line =~ m/^\Q$zpath\E@(.*)$/) {
-	    push @$snaps, $1;
-	}
-    };
-
-    eval { run_command( [$cmd], outfunc => $outfunc , errfunc => sub{}); };
-
-    # return an empty array if dataset does not exist.
-    return $snaps;
+	$info->{$snap_name} = {
+	    id => $guid,
+	    timestamp => $creation,
+	};
+    }
+    return $info;
 }
 
 my sub dataset_mounted_heuristic {
@@ -687,6 +696,7 @@ sub volume_has_feature {
 	copy => { base => 1, current => 1},
 	sparseinit => { base => 1, current => 1},
 	replicate => { base => 1, current => 1},
+	rename => {current => 1},
     };
 
     my ($vtype, $name, $vmid, $basename, $basevmid, $isBase) =
@@ -747,7 +757,7 @@ sub volume_export_formats {
 }
 
 sub volume_import {
-    my ($class, $scfg, $storeid, $fh, $volname, $format, $base_snapshot, $with_snapshots, $allow_rename) = @_;
+    my ($class, $scfg, $storeid, $fh, $volname, $format, $snapshot, $base_snapshot, $with_snapshots, $allow_rename) = @_;
 
     die "unsupported import stream format for $class: $format\n"
 	if $format ne 'zfs';
@@ -784,9 +794,39 @@ sub volume_import {
 }
 
 sub volume_import_formats {
-    my ($class, $scfg, $storeid, $volname, $base_snapshot, $with_snapshots) = @_;
+    my ($class, $scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots) = @_;
 
-    return $class->volume_export_formats($scfg, $storeid, $volname, undef, $base_snapshot, $with_snapshots);
+    return $class->volume_export_formats($scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots);
+}
+
+sub rename_volume {
+    my ($class, $scfg, $storeid, $source_volname, $target_vmid, $target_volname) = @_;
+
+    my (
+	undef,
+	$source_image,
+	$source_vmid,
+	$base_name,
+	$base_vmid,
+	undef,
+	$format
+    ) = $class->parse_volname($source_volname);
+    $target_volname = $class->find_free_diskname($storeid, $scfg, $target_vmid, $format)
+	if !$target_volname;
+
+    my $pool = $scfg->{pool};
+    my $source_zfspath = "${pool}/${source_image}";
+    my $target_zfspath = "${pool}/${target_volname}";
+
+    my $exists = 0 == run_command(['zfs', 'get', '-H', 'name', $target_zfspath],
+				  noerr => 1, quiet => 1);
+    die "target volume '${target_volname}' already exists\n" if $exists;
+
+    $class->zfs_request($scfg, 5, 'rename', ${source_zfspath}, ${target_zfspath});
+
+    $base_name = $base_name ? "${base_name}/" : '';
+
+    return "${storeid}:${base_name}${target_volname}";
 }
 
 1;
