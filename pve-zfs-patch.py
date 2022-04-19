@@ -89,7 +89,7 @@ for file in patches:
 	else:
 		for md5, path in file['PATCHES'].items():
 			if md5sum(sys.path[0] + '/' + path) == checksumm_current:
-				sys.exit("Patch "+ path + " already applyed.")
+				print("Patch "+ path + " already applyed.")
 		if not noemail:
 			print("Sending email whith error to: " + email)
 			SendMail(email, "Patch ERROR on " + fqdn, "Patch can not bee applyed to current version " + file['SYSFILE'])
