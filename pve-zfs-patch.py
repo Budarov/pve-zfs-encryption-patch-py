@@ -87,9 +87,14 @@ for file in patches:
 			SendMail(email, "Patch applyed on " + fqdn, "Patch applyed on " + fqdn + " Original " + file['SYSFILE'] +" file rename to: " + file['SYSFILE'] + today.strftime("%Y-%m-%d"))
 		print("Patch " + file['SYSFILE'] + " applyed.")
 	else:
+		flag = False
 		for md5, path in file['PATCHES'].items():
 			if md5sum(sys.path[0] + '/' + path) == checksumm_current:
 				print("Patch "+ path + " already applyed.")
+				flag = True
+				break
+		if flag:
+			continue
 		if not noemail:
 			print("Sending email whith error to: " + email)
 			SendMail(email, "Patch ERROR on " + fqdn, "Patch can not bee applyed to current version " + file['SYSFILE'])
